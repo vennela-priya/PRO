@@ -1,0 +1,196 @@
+# ============================================================
+# Brain Tumor MRI Classification — Master Configuration
+# ============================================================
+
+project:
+  name: BrainTumorAI
+  version: "1.0.0"
+  seed: 42
+  device: "cpu"           # cuda | cpu
+  mixed_precision: false
+  compile_model: false    # torch.compile (PyTorch 2.x)
+
+# ----------------------------------------------------------
+# Dataset
+# ----------------------------------------------------------
+data:
+  root_dir: "C:/Users/HP/Desktop/MainProject/Project"
+  train_dir: "C:/Users/HP/Desktop/MainProject/Project/Training"
+  test_dir:  "C:/Users/HP/Desktop/MainProject/Project/Testing"
+  processed_dir: "data/processed"
+  num_classes: 4
+  class_names: ["glioma", "meningioma", "notumor", "pituitary"]
+  image_size: 224
+  val_split: 0.20          # 20% of Training folder → validation
+  holdout_csv: "data/processed/test_holdout.csv"
+  trainval_csv: "data/processed/trainval.csv"
+  stratified: true
+  cache_dataset: false
+  num_workers: 0
+  pin_memory: false
+
+# ----------------------------------------------------------
+# Augmentation
+# ----------------------------------------------------------
+augmentation:
+  train:
+    horizontal_flip: 0.5
+    vertical_flip: 0.1
+    rotation_degrees: 15
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      hue: 0.05
+    gaussian_blur: 0.2
+    gaussian_noise_std: 0.02
+    elastic_transform: 0.3
+    grid_distortion: 0.2
+    random_erasing: 0.1
+    cutmix_alpha: 0.4
+    mixup_alpha: 0.2
+    normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+  val:
+    normalize:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+
+# ----------------------------------------------------------
+# Models
+# ----------------------------------------------------------
+models:
+  efficientnet:
+    backbone: "efficientnetv2_m"
+    pretrained: true
+    dropout: 0.3
+    classifier_hidden: 512
+    num_classes: 3
+
+  resnet_cbam:
+    backbone: "resnet50"
+    pretrained: true
+    cbam_reduction: 16
+    dropout: 0.3
+    classifier_hidden: 512
+    num_classes: 3
+
+  vit:
+    backbone: "vit_base_patch16_224"
+    pretrained: true
+    dropout: 0.1
+    num_classes: 3
+
+  ensemble:
+    weights:
+      efficientnet: 0.4
+      resnet_cbam: 0.3
+      vit: 0.3
+    temperature_scaling: true
+    calibration_epochs: 5
+
+  unet:
+    encoder: "efficientnet-b4"
+    pretrained: "imagenet"
+    in_channels: 3
+    classes: 1
+    activation: "sigmoid"
+
+# ----------------------------------------------------------
+# Training
+# ----------------------------------------------------------
+training:
+  batch_size: 16
+  accumulation_steps: 2        # effective batch = 64
+  phase1:
+    epochs: 10
+    lr: 1.0e-3
+    freeze_backbone: true
+  phase2:
+    epochs: 30
+    lr: 1.0e-4
+    freeze_backbone: false
+    scheduler: "cosine_annealing"
+    warmup_epochs: 3
+  phase3:
+    epochs: 5
+    lr: 1.0e-5
+    description: "ensemble calibration"
+
+  optimizer:
+    name: "adamw"
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  loss:
+    classification: "weighted_crossentropy"
+    label_smoothing: 0.1
+    focal_gamma: 2.0              # focal loss gamma
+    use_focal: false              # toggle focal vs CE
+
+  unet_loss:
+    dice_weight: 0.5
+    bce_weight: 0.5
+
+  early_stopping:
+    patience: 10
+    monitor: "val_auc"
+    mode: "max"
+
+  checkpoint:
+    save_dir: "checkpoints"
+    save_top_k: 3
+    monitor: "val_auc"
+
+# ----------------------------------------------------------
+# Evaluation
+# ----------------------------------------------------------
+evaluation:
+  bootstrap_iterations: 1000
+  confidence_level: 0.95
+  metrics: ["accuracy", "auc", "sensitivity", "specificity", "f1", "precision"]
+  confusion_matrix: true
+  roc_curve: true
+  pr_curve: true
+  results_dir: "results"
+
+# ----------------------------------------------------------
+# XAI
+# ----------------------------------------------------------
+xai:
+  gradcam:
+    enabled: true
+    method: "gradcam++"
+    output_dir: "outputs/heatmaps"
+    alpha: 0.5                    # overlay transparency
+  shap:
+    enabled: true
+    n_samples: 50
+    output_dir: "outputs/shap"
+  integrated_gradients:
+    enabled: true
+    n_steps: 50
+    output_dir: "outputs/ig"
+  sample_test_cases: 5           # cases to visualize (per-class + FP + FN)
+
+# ----------------------------------------------------------
+# Inference / API
+# ----------------------------------------------------------
+inference:
+  latency_budget_ms: 500
+  batch_size: 1
+  tta_enabled: true              # test-time augmentation
+  tta_n_augments: 5
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 1
+  reload: false
+
+ui:
+  gradio_port: 7860
+  share: false
+  theme: "soft"

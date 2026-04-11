@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+*.pt
+*.pth
+*.onnx
+data/raw/
+data/processed/
+checkpoints/
+outputs/
+runs/
+.pytest_cache/
+htmlcov/
+.coverage
+*.log
+
+# Large archives — excluded from git (too large for GitHub)
+*.zip
+*.tar.gz
+*.tar
+
+# Raw training dataset — large (download from Kaggle)
+Project/Training/
+data/Testing*/
+
+# App runtime logs
+app_launch.log
