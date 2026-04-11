@@ -82,6 +82,18 @@ except ImportError as _gc_err:
     _GRADCAM = False
     logger.warning(f"GradCAM modules not available: {_gc_err}")
 
+# ── U-Net Segmentation ────────────────────────────────────────────────────
+try:
+    from inference.segmenter import TumorSegmenter
+    from visualization.seg_charts import (
+        plot_seg_panel, plot_seg_vs_gradcam, seg_stats_html as _seg_html_fn,
+    )
+    _SEG = True
+    logger.info("Segmentation modules loaded")
+except ImportError as _seg_err:
+    _SEG = False
+    logger.warning(f"Segmentation modules not available: {_seg_err}")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -990,7 +1002,7 @@ METRIC_BOX = """
 </div>"""
 
 
-def build_ui(model_obj, model_mode: str, gradcam_engine=None) -> gr.Blocks:
+def build_ui(model_obj, model_mode: str, gradcam_engine=None, segmenter=None) -> gr.Blocks:
     bc_map  = {"live":"#10b981","partial":"#f59e0b","demo":"#3b82f6"}
     bdg_map = {"live":"🟢 Live Model","partial":"🟡 Partial Model","demo":"🔵 Demo Mode"}
     bc      = bc_map.get(model_mode, "#94a3b8")
@@ -1012,6 +1024,7 @@ def build_ui(model_obj, model_mode: str, gradcam_engine=None) -> gr.Blocks:
         result_st  = gr.State(None)
         image_st   = gr.State(None)
         gradcam_st = gr.State(None)
+        seg_st     = gr.State(None)
         count_st  = gr.State(0)
 
         gr.HTML(header_html)
@@ -1096,6 +1109,21 @@ def build_ui(model_obj, model_mode: str, gradcam_engine=None) -> gr.Blocks:
                             height=220,
                             interactive=False,
                         )
+
+                # ── U-Net Segmentation Section ────────────────────────────
+                with gr.Accordion("🔬 Tumour Segmentation (U-Net)", open=False):
+                    seg_panel = gr.Image(
+                        label="Segmentation Panel  (Prob Map | Overlay | Contour)",
+                        show_label=True,
+                        height=200,
+                        interactive=False,
+                    )
+                    seg_html_out = gr.HTML("")
+                    seg_cmp = gr.Image(
+                        label="Grad-CAM vs U-Net Agreement",
+                        height=200,
+                        interactive=False,
+                    )
 
                 # Example gallery
                 gr.HTML('<div style="font-size:10px;letter-spacing:2px;color:#475569;'
@@ -1217,13 +1245,14 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
         # ── CALLBACKS ──────────────────────────────────────────────────────
 
         def on_analyze(image, pid, count):
-            _gc_none = (None, "", None, None, None)  # 5 GradCAM placeholders
+            _gc_none  = (None, "", None, None, None)   # 5 GradCAM placeholders
+            _seg_none = (None, "", None, None)          # 4 Segmentation placeholders
             if image is None:
                 empty = ('<div style="text-align:center;color:#ef4444;padding:20px;'
                          'font-family:Inter,sans-serif;">⚠ Please upload an MRI image first.</div>')
                 return (empty, None, None, None, None, None, count,
                         '<div style="color:#ef4444;font-size:11px;text-align:center;">No image</div>',
-                        *_gc_none)
+                        *_gc_none, *_seg_none)
             try:
                 r = run_inference(model_obj, image)
                 if "error" in r:
@@ -1231,6 +1260,19 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                 count = (count or 0) + 1
                 st_html = (f'<div style="text-align:center;color:#10b981;font-size:11px;">'
                            f'✓ Analysis complete · Session: {count} image(s) analyzed</div>')
+
+                # ── Build orig_rgb once — shared by GradCAM + Segmenter ──
+                if isinstance(image, np.ndarray):
+                    orig_rgb = image.copy()
+                    if orig_rgb.dtype != np.uint8:
+                        orig_rgb = np.clip(orig_rgb, 0, 255).astype(np.uint8)
+                    if orig_rgb.ndim == 2:
+                        orig_rgb = cv2.cvtColor(orig_rgb, cv2.COLOR_GRAY2RGB)
+                    elif orig_rgb.ndim == 3 and orig_rgb.shape[2] == 4:
+                        orig_rgb = cv2.cvtColor(orig_rgb, cv2.COLOR_RGBA2RGB)
+                else:
+                    orig_rgb = np.array(
+                        Image.fromarray(np.array(image)).convert("RGB"), dtype=np.uint8)
 
                 # ── Grad-CAM ──────────────────────────────────────────────
                 gc_composite = None
@@ -1240,18 +1282,6 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                 gc_result    = None
                 if gradcam_engine is not None and _GRADCAM:
                     try:
-                        # Convert image to uint8 RGB numpy for GradCAM
-                        if isinstance(image, np.ndarray):
-                            orig_rgb = image.copy()
-                            if orig_rgb.dtype != np.uint8:
-                                orig_rgb = np.clip(orig_rgb, 0, 255).astype(np.uint8)
-                            if orig_rgb.ndim == 2:
-                                orig_rgb = cv2.cvtColor(orig_rgb, cv2.COLOR_GRAY2RGB)
-                            elif orig_rgb.shape[2] == 4:
-                                orig_rgb = cv2.cvtColor(orig_rgb, cv2.COLOR_RGBA2RGB)
-                        else:
-                            orig_rgb = np.array(
-                                Image.fromarray(np.array(image)).convert("RGB"), dtype=np.uint8)
 
                         tensor_gc = preprocess(image)
                         if tensor_gc is not None:
@@ -1275,6 +1305,46 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                     except Exception as eg:
                         logger.warning(f"[GradCAM] failed during UI run: {eg}")
 
+                # ── U-Net Segmentation ────────────────────────────────────
+                seg_panel_arr = None
+                seg_html_str  = ""
+                seg_cmp_arr   = None
+                seg_result    = None
+                if segmenter is not None and _SEG:
+                    try:
+                        seg_result = segmenter.segment(orig_rgb)
+
+                        # Compare with GradCAM if available
+                        if gc_result is not None:
+                            seg_result = segmenter.compare_with_gradcam(
+                                seg_result, gc_result["cam"])
+                            seg_cmp_arr = plot_seg_vs_gradcam(
+                                gc_result["cam"],
+                                seg_result["cam_mask"],
+                                seg_result["binary_mask"],
+                                orig_rgb,
+                                dice=seg_result.get("dice_vs_cam"),
+                                iou=seg_result.get("iou_vs_cam"),
+                            )
+
+                        seg_panel_arr = plot_seg_panel(
+                            original    = orig_rgb,
+                            prob_map    = seg_result["prob_map"],
+                            overlay     = seg_result["overlay"],
+                            contour     = seg_result["contour"],
+                            area_pct    = seg_result["area_pct"],
+                            dice_vs_cam = seg_result.get("dice_vs_cam"),
+                            iou_vs_cam  = seg_result.get("iou_vs_cam"),
+                            demo        = seg_result["demo"],
+                        )
+                        seg_html_str = _seg_html_fn(seg_result)
+                        logger.info(
+                            f"[Seg] done ({seg_result['elapsed']:.2f}s, "
+                            f"area={seg_result['area_pct']:.1f}%, "
+                            f"demo={seg_result['demo']})")
+                    except Exception as es:
+                        logger.warning(f"[Seg] failed: {es}")
+
                 return (
                     diagnosis_card(r),
                     chart_gauge(r["confidence"], r["class"]),
@@ -1282,6 +1352,7 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                     chart_radar(r["individual"]),
                     r, image, count, st_html,
                     gc_composite, gc_html_str, gc_loc_img, gc_prof_img, gc_result,
+                    seg_panel_arr, seg_html_str, seg_cmp_arr, seg_result,
                 )
             except Exception as e:
                 logger.error(f"Analysis: {e}")
@@ -1289,14 +1360,15 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                        f'font-family:Inter,sans-serif;">⚠ {e}</div>')
                 return (err, None, None, None, None, None, count,
                         f'<div style="color:#ef4444;font-size:11px;">Error: {e}</div>',
-                        *_gc_none)
+                        *_gc_none, *_seg_none)
 
         run_btn.click(
             fn=on_analyze,
             inputs=[img_in, pid_in, count_st],
             outputs=[diag_out, gauge_out, prob_out,
                      radar_out, result_st, image_st, count_st, status_out,
-                     gradcam_img, gradcam_html, gradcam_loc, gradcam_prof, gradcam_st],
+                     gradcam_img, gradcam_html, gradcam_loc, gradcam_prof, gradcam_st,
+                     seg_panel, seg_html_out, seg_cmp, seg_st],
         )
 
         # Example buttons — use closure to avoid numpy-array default-arg bug
@@ -1364,7 +1436,16 @@ def main():
         except Exception as _eg:
             logger.warning(f"GradCAM engine init failed: {_eg}")
 
-    demo = build_ui(model_obj, model_mode, gradcam_engine)
+    segmenter = None
+    if _SEG:
+        try:
+            segmenter = TumorSegmenter()
+            logger.info(
+                f"Segmenter ready  (demo={segmenter.demo})")
+        except Exception as _es:
+            logger.warning(f"Segmenter init failed: {_es}")
+
+    demo = build_ui(model_obj, model_mode, gradcam_engine, segmenter)
 
     port = int(os.environ.get("GRADIO_SERVER_PORT", 7862))
     logger.info(f"Launching at http://localhost:{port}")
