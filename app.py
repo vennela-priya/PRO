@@ -68,6 +68,20 @@ except ImportError:
     _PDF = False
     logger.warning("reportlab not installed — PDF disabled (pip install reportlab)")
 
+# ── GradCAM + visualization charts + enhanced report ─────────────────────
+try:
+    from inference.gradcam import EnsembleGradCAM
+    from visualization.charts import (
+        plot_gradcam_panel, plot_tumor_location,
+        plot_activation_profile, gradcam_stats_html,
+    )
+    from report.report_generator import generate_report as _generate_report_v2
+    _GRADCAM = True
+    logger.info("GradCAM modules loaded")
+except ImportError as _gc_err:
+    _GRADCAM = False
+    logger.warning(f"GradCAM modules not available: {_gc_err}")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -976,7 +990,7 @@ METRIC_BOX = """
 </div>"""
 
 
-def build_ui(model_obj, model_mode: str) -> gr.Blocks:
+def build_ui(model_obj, model_mode: str, gradcam_engine=None) -> gr.Blocks:
     bc_map  = {"live":"#10b981","partial":"#f59e0b","demo":"#3b82f6"}
     bdg_map = {"live":"🟢 Live Model","partial":"🟡 Partial Model","demo":"🔵 Demo Mode"}
     bc      = bc_map.get(model_mode, "#94a3b8")
@@ -995,8 +1009,9 @@ def build_ui(model_obj, model_mode: str) -> gr.Blocks:
     ex_imgs = example_images()
 
     with gr.Blocks(css=CSS, title="NeuroScan AI", theme=gr.themes.Base()) as demo:
-        result_st = gr.State(None)
-        image_st  = gr.State(None)
+        result_st  = gr.State(None)
+        image_st   = gr.State(None)
+        gradcam_st = gr.State(None)
         count_st  = gr.State(0)
 
         gr.HTML(header_html)
@@ -1060,6 +1075,27 @@ def build_ui(model_obj, model_mode: str) -> gr.Blocks:
                         with gr.Row():
                             gauge_out = gr.Plot(show_label=False)
                             prob_out  = gr.Plot(show_label=False)
+
+                # ── Grad-CAM Heatmap Section ──────────────────────────────
+                with gr.Accordion("🔥 Grad-CAM Heatmap Analysis", open=False):
+                    gradcam_img = gr.Image(
+                        label="GradCAM 4-Panel  (Original | Heatmap | Overlay | Boundary)",
+                        show_label=True,
+                        height=224,
+                        interactive=False,
+                    )
+                    gradcam_html = gr.HTML("")
+                    with gr.Row():
+                        gradcam_loc  = gr.Image(
+                            label="Tumor Location Diagram",
+                            height=220,
+                            interactive=False,
+                        )
+                        gradcam_prof = gr.Image(
+                            label="Activation Profile",
+                            height=220,
+                            interactive=False,
+                        )
 
                 # Example gallery
                 gr.HTML('<div style="font-size:10px;letter-spacing:2px;color:#475569;'
@@ -1181,11 +1217,13 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
         # ── CALLBACKS ──────────────────────────────────────────────────────
 
         def on_analyze(image, pid, count):
+            _gc_none = (None, "", None, None, None)  # 5 GradCAM placeholders
             if image is None:
                 empty = ('<div style="text-align:center;color:#ef4444;padding:20px;'
                          'font-family:Inter,sans-serif;">⚠ Please upload an MRI image first.</div>')
-                return empty, None, None, None, None, None, count, \
-                    '<div style="color:#ef4444;font-size:11px;text-align:center;">No image</div>'
+                return (empty, None, None, None, None, None, count,
+                        '<div style="color:#ef4444;font-size:11px;text-align:center;">No image</div>',
+                        *_gc_none)
             try:
                 r = run_inference(model_obj, image)
                 if "error" in r:
@@ -1193,25 +1231,72 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                 count = (count or 0) + 1
                 st_html = (f'<div style="text-align:center;color:#10b981;font-size:11px;">'
                            f'✓ Analysis complete · Session: {count} image(s) analyzed</div>')
+
+                # ── Grad-CAM ──────────────────────────────────────────────
+                gc_composite = None
+                gc_html_str  = ""
+                gc_loc_img   = None
+                gc_prof_img  = None
+                gc_result    = None
+                if gradcam_engine is not None and _GRADCAM:
+                    try:
+                        # Convert image to uint8 RGB numpy for GradCAM
+                        if isinstance(image, np.ndarray):
+                            orig_rgb = image.copy()
+                            if orig_rgb.dtype != np.uint8:
+                                orig_rgb = np.clip(orig_rgb, 0, 255).astype(np.uint8)
+                            if orig_rgb.ndim == 2:
+                                orig_rgb = cv2.cvtColor(orig_rgb, cv2.COLOR_GRAY2RGB)
+                            elif orig_rgb.shape[2] == 4:
+                                orig_rgb = cv2.cvtColor(orig_rgb, cv2.COLOR_RGBA2RGB)
+                        else:
+                            orig_rgb = np.array(
+                                Image.fromarray(np.array(image)).convert("RGB"), dtype=np.uint8)
+
+                        tensor_gc = preprocess(image)
+                        if tensor_gc is not None:
+                            tensor_gc = tensor_gc.to(DEVICE)
+                            gc_result = gradcam_engine.generate(tensor_gc, r, orig_rgb)
+                            vis = gc_result["visuals"]
+                            stats = gc_result["stats"]
+                            gc_composite = vis["composite"]   # [224, 896, 3] uint8
+                            gc_html_str  = gradcam_stats_html(
+                                stats, gc_result["elapsed"], gc_result["demo"])
+                            gc_loc_img   = plot_tumor_location(
+                                stats["centroid"], stats["bbox"],
+                                stats["lateralization"], orig_rgb.shape[:2],
+                                gc_result["cam"],
+                            )
+                            gc_prof_img  = plot_activation_profile(
+                                gc_result["cam"], r["class_label"])
+                            logger.info(
+                                f"[GradCAM] done ({gc_result['elapsed']:.2f}s, "
+                                f"demo={gc_result['demo']})")
+                    except Exception as eg:
+                        logger.warning(f"[GradCAM] failed during UI run: {eg}")
+
                 return (
                     diagnosis_card(r),
                     chart_gauge(r["confidence"], r["class"]),
                     chart_prob_bars(r["probabilities"]),
                     chart_radar(r["individual"]),
                     r, image, count, st_html,
+                    gc_composite, gc_html_str, gc_loc_img, gc_prof_img, gc_result,
                 )
             except Exception as e:
                 logger.error(f"Analysis: {e}")
                 err = (f'<div style="text-align:center;color:#ef4444;padding:20px;'
                        f'font-family:Inter,sans-serif;">⚠ {e}</div>')
-                return err, None, None, None, None, None, count, \
-                    f'<div style="color:#ef4444;font-size:11px;">Error: {e}</div>'
+                return (err, None, None, None, None, None, count,
+                        f'<div style="color:#ef4444;font-size:11px;">Error: {e}</div>',
+                        *_gc_none)
 
         run_btn.click(
             fn=on_analyze,
             inputs=[img_in, pid_in, count_st],
             outputs=[diag_out, gauge_out, prob_out,
-                     radar_out, result_st, image_st, count_st, status_out],
+                     radar_out, result_st, image_st, count_st, status_out,
+                     gradcam_img, gradcam_html, gradcam_loc, gradcam_prof, gradcam_st],
         )
 
         # Example buttons — use closure to avoid numpy-array default-arg bug
@@ -1222,32 +1307,36 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
             btn.click(fn=_make_loader(arr), inputs=[], outputs=[img_in])
 
         # PDF report
-        def on_report(r_st, i_st, name, pid):
+        def on_report(r_st, i_st, gc_st, name, pid):
             if r_st is None:
                 return ('<div style="color:#ef4444;font-size:11px;">'
                         '⚠ Run a diagnosis first.</div>',
-                        gr.update(visible=False), None)
+                        gr.update(visible=False))
             if not _PDF:
                 return ('<div style="color:#f59e0b;font-size:11px;">'
                         '⚠ Install reportlab: pip install reportlab</div>',
-                        gr.update(visible=False), None)
+                        gr.update(visible=False))
             try:
-                path = generate_pdf(r_st, i_st, name, pid)
+                # Use enhanced GradCAM-aware report when available
+                if _GRADCAM and gc_st is not None:
+                    path = _generate_report_v2(r_st, i_st, gc_st, name, pid)
+                else:
+                    path = generate_pdf(r_st, i_st, name, pid)
                 if path and Path(path).exists():
                     return ('<div style="color:#10b981;font-size:11px;">'
                             '✓ Report generated!</div>',
-                            gr.update(visible=True), path)
+                            gr.update(visible=True, value=path))
                 return ('<div style="color:#ef4444;font-size:11px;">PDF failed.</div>',
-                        gr.update(visible=False), None)
+                        gr.update(visible=False))
             except Exception as e:
                 logger.error(f"PDF: {e}")
                 return (f'<div style="color:#ef4444;font-size:11px;">Error: {e}</div>',
-                        gr.update(visible=False), None)
+                        gr.update(visible=False))
 
         rep_btn.click(
             fn=on_report,
-            inputs=[result_st, image_st, rep_name, rep_id],
-            outputs=[rep_st, pdf_dl, pdf_dl],
+            inputs=[result_st, image_st, gradcam_st, rep_name, rep_id],
+            outputs=[rep_st, pdf_dl],
         )
 
     return demo
@@ -1267,12 +1356,21 @@ def main():
     model_obj, model_mode = load_model()
     logger.info(f"Model mode: {model_mode}")
 
-    demo = build_ui(model_obj, model_mode)
+    gradcam_engine = None
+    if _GRADCAM:
+        try:
+            gradcam_engine = EnsembleGradCAM(model_obj, model_mode)
+            logger.info("GradCAM engine ready")
+        except Exception as _eg:
+            logger.warning(f"GradCAM engine init failed: {_eg}")
 
-    logger.info("Launching at http://localhost:7860")
+    demo = build_ui(model_obj, model_mode, gradcam_engine)
+
+    port = int(os.environ.get("GRADIO_SERVER_PORT", 7862))
+    logger.info(f"Launching at http://localhost:{port}")
     demo.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=port,
         inbrowser=True,
         show_error=True,
         share=False,
