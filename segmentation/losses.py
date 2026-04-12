@@ -1,104 +1,91 @@
-"""
-segmentation/losses.py
-======================
-Loss functions for binary tumour segmentation.
-
-Available
----------
-dice_loss       — pure Dice loss (1 - Dice coefficient)
-BCEDiceLoss     — weighted sum of BCE + Dice (most stable in practice)
-
-Both accept raw logits (no sigmoid needed externally).
-"""
-from __future__ import annotations
-
+"""segmentation/losses.py — Loss functions for binary tumour segmentation."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def dice_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    smooth: float = 1.0,
-) -> torch.Tensor:
-    """
-    Dice loss computed from raw logits.
+class TverskyLoss(nn.Module):
+    """Tversky loss — penalises FP more than FN when alpha > beta."""
 
-    Parameters
-    ----------
-    logits  : (B, 1, H, W)  — raw model output (no sigmoid)
-    targets : (B, 1, H, W)  — binary ground-truth {0, 1}
-    smooth  : Laplace smoothing term (avoids divide-by-zero)
-
-    Returns
-    -------
-    Scalar tensor — Dice loss value in [0, 1].
-    """
-    probs = torch.sigmoid(logits)
-
-    # Flatten spatial dims
-    probs   = probs.view(probs.size(0),   -1)   # (B, H*W)
-    targets = targets.view(targets.size(0), -1) # (B, H*W)
-
-    intersection = (probs * targets).sum(dim=1)             # (B,)
-    dice = (2.0 * intersection + smooth) / (
-        probs.sum(dim=1) + targets.sum(dim=1) + smooth
-    )                                                        # (B,)
-    return 1.0 - dice.mean()
-
-
-class BCEDiceLoss(nn.Module):
-    """
-    Combined Binary Cross-Entropy + Dice loss.
-
-        L = alpha * BCE(logits, targets) + (1 - alpha) * Dice(logits, targets)
-
-    Parameters
-    ----------
-    alpha  : weight for BCE term (0.5 → equal weighting, default)
-    smooth : smoothing constant for Dice denominator
-
-    Notes
-    -----
-    * BCE stabilises gradients early in training (avoids flat Dice landscape).
-    * Dice aligns the objective with the evaluation metric.
-    * alpha=0.5 is a strong default; tune towards 0.3 if masks are large,
-      towards 0.7 if masks are small relative to image.
-    """
-
-    def __init__(self, alpha: float = 0.5, smooth: float = 1.0):
+    def __init__(self, alpha=0.7, beta=0.3, smooth=1.0):
         super().__init__()
-        if not 0.0 <= alpha <= 1.0:
-            raise ValueError(f"alpha must be in [0,1], got {alpha}")
         self.alpha  = alpha
+        self.beta   = beta
         self.smooth = smooth
 
-    def forward(
+    def forward(self, logits, targets):
+        probs     = torch.sigmoid(logits)
+        probs_f   = probs.view(probs.size(0),     -1)
+        targets_f = targets.view(targets.size(0), -1)
+        TP = (probs_f * targets_f).sum(1)
+        FP = (probs_f * (1 - targets_f)).sum(1)
+        FN = ((1 - probs_f) * targets_f).sum(1)
+        tversky = (TP + self.smooth) / (
+            TP + self.alpha * FP + self.beta * FN + self.smooth)
+        return (1 - tversky).mean()
+
+
+class DiceLoss(nn.Module):
+    """Soft Dice loss."""
+
+    def __init__(self, smooth=1.0):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs     = torch.sigmoid(logits)
+        probs_f   = probs.view(probs.size(0),     -1)
+        targets_f = targets.view(targets.size(0), -1)
+        inter = (probs_f * targets_f).sum(1)
+        dice  = (2 * inter + self.smooth) / (
+            probs_f.sum(1) + targets_f.sum(1) + self.smooth)
+        return (1 - dice).mean()
+
+
+class BoundaryLoss(nn.Module):
+    """BCE weighted 2x at tumour boundary pixels."""
+
+    def __init__(self, boundary_weight=2.0, kernel_size=5):
+        super().__init__()
+        self.boundary_weight = boundary_weight
+        self.kernel_size     = kernel_size
+
+    def forward(self, logits, targets):
+        bce_map = F.binary_cross_entropy_with_logits(
+            logits, targets, reduction='none')
+        with torch.no_grad():
+            pad      = self.kernel_size // 2
+            dil      = F.max_pool2d(targets,  self.kernel_size, stride=1, padding=pad)
+            ero      = -F.max_pool2d(-targets, self.kernel_size, stride=1, padding=pad)
+            boundary = (dil - ero).clamp(0, 1)
+            weight   = 1.0 + self.boundary_weight * boundary
+        return (bce_map * weight).mean()
+
+
+class CombinedSegLoss(nn.Module):
+    """
+    0.5 * Tversky + 0.3 * Dice + 0.2 * Boundary.
+    forward() returns a SCALAR tensor (not a tuple).
+    """
+
+    def __init__(
         self,
-        logits:  torch.Tensor,
-        targets: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        """
-        Parameters
-        ----------
-        logits  : (B, 1, H, W)  raw model output
-        targets : (B, 1, H, W)  binary float {0.0, 1.0}
+        tversky_alpha=0.7, tversky_beta=0.3,
+        boundary_weight=2.0,
+        w_tversky=0.5, w_dice=0.3, w_boundary=0.2,
+        smooth=1.0,
+    ):
+        super().__init__()
+        self.tversky  = TverskyLoss(tversky_alpha, tversky_beta, smooth)
+        self.dice     = DiceLoss(smooth)
+        self.boundary = BoundaryLoss(boundary_weight)
+        self.w_t = w_tversky
+        self.w_d = w_dice
+        self.w_b = w_boundary
 
-        Returns
-        -------
-        total_loss : scalar tensor (backpropagatable)
-        components : dict with keys 'bce', 'dice', 'total' (float values
-                     for logging — already detached)
-        """
-        bce  = F.binary_cross_entropy_with_logits(logits, targets)
-        dice = dice_loss(logits, targets, self.smooth)
-
-        total = self.alpha * bce + (1.0 - self.alpha) * dice
-
-        components = {
-            "bce":   bce.item(),
-            "dice":  dice.item(),
-            "total": total.item(),
-        }
-        return total, components
+    def forward(self, logits, targets):
+        return (
+            self.w_t * self.tversky(logits, targets) +
+            self.w_d * self.dice(logits, targets)    +
+            self.w_b * self.boundary(logits, targets)
+        )

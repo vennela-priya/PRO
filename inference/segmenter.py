@@ -35,16 +35,25 @@ def _find_checkpoint() -> Optional[str]:
     for base in _CKPT_SEARCH:
         p = Path(base)
         if p.exists():
-            candidates.extend(p.glob("unet*.pt"))
-    if not candidates:
+            candidates.extend(p.glob("*.pt"))
+            candidates.extend(p.glob("*.pth"))
+    # Deduplicate (same file via different patterns)
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for c in candidates:
+        r = c.resolve()
+        if r not in seen:
+            seen.add(r)
+            unique.append(c)
+    if not unique:
         return None
-    best = [c for c in candidates if "best" in c.name]
-    pool = best or candidates
+    # Prefer files with "best" in the name, then pick newest by mtime
+    best = [c for c in unique if "best" in c.name.lower()]
+    pool = best or unique
     return str(max(pool, key=lambda f: f.stat().st_mtime))
 
 
 def _load_unet(checkpoint_path: Optional[str], device: torch.device) -> tuple:
-    from segmentation.unet import UNet
     path = checkpoint_path or _find_checkpoint()
     if path is None or not Path(path).exists():
         logger.info("[Segmenter] No checkpoint found — demo mode")
@@ -52,17 +61,30 @@ def _load_unet(checkpoint_path: Optional[str], device: torch.device) -> tuple:
     try:
         ckpt  = torch.load(path, map_location=device, weights_only=False)
         cfg   = ckpt.get("config", {})
-        model = UNet(
-            in_channels  = cfg.get("in_channels",  3),   # default 3 (RGB)
-            base_filters = cfg.get("base_filters", 32),
-            bilinear     = cfg.get("bilinear",     True),
-        )
+        arch  = cfg.get("architecture", "unet").lower()
+
+        # Auto-select AttentionUNet or vanilla UNet based on saved config
+        if "attention" in arch:
+            from segmentation.attention_unet import AttentionUNet
+            model = AttentionUNet(
+                in_channels  = cfg.get("in_channels",  3),
+                base_filters = cfg.get("base_filters", 32),
+                bilinear     = cfg.get("bilinear",     True),
+            )
+        else:
+            from segmentation.unet import UNet
+            model = UNet(
+                in_channels  = cfg.get("in_channels",  3),
+                base_filters = cfg.get("base_filters", 32),
+                bilinear     = cfg.get("bilinear",     True),
+            )
+
         model.load_state_dict(ckpt["model_state_dict"])
         model.eval().to(device)
         dice = ckpt.get("val_dice", "?")
-        logger.info(f"[Segmenter] Loaded {Path(path).name}  val_dice={dice:.4f}"
+        logger.info(f"[Segmenter] Loaded {Path(path).name}  arch={arch}  val_dice={dice:.4f}"
                     if isinstance(dice, float) else
-                    f"[Segmenter] Loaded {Path(path).name}")
+                    f"[Segmenter] Loaded {Path(path).name}  arch={arch}")
         return model, cfg
     except Exception as e:
         logger.warning(f"[Segmenter] Load failed: {e} — demo mode")
@@ -70,7 +92,7 @@ def _load_unet(checkpoint_path: Optional[str], device: torch.device) -> tuple:
 
 
 def _postprocess(prob_map: np.ndarray, threshold: float = 0.5,
-                 min_area_pct: float = 0.3) -> np.ndarray:
+                 min_area_pct: float = 0.3, erode_px: int = 2) -> np.ndarray:
     """
     Convert probability map to clean binary mask.
 
@@ -79,6 +101,7 @@ def _postprocess(prob_map: np.ndarray, threshold: float = 0.5,
       2. Morphological open  (remove salt noise, radius ~1 % of image)
       3. Morphological close (fill holes,        radius ~2 % of image)
       4. Remove components smaller than min_area_pct % of image pixels
+      5. Erode by erode_px pixels to tighten boundary (reduce over-segmentation)
     """
     H, W  = prob_map.shape
     binary = (prob_map >= threshold).astype(np.uint8)
@@ -93,12 +116,18 @@ def _postprocess(prob_map: np.ndarray, threshold: float = 0.5,
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k_close)
 
     # Remove tiny components
-    min_px  = int(H * W * min_area_pct / 100)
+    min_px  = max(1, int(H * W * min_area_pct / 100))
     n_comp, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
     clean = np.zeros_like(binary)
     for lbl in range(1, n_comp):
         if stats[lbl, cv2.CC_STAT_AREA] >= min_px:
             clean[labels == lbl] = 1
+
+    # Boundary erosion — tighten contour to reduce over-segmentation
+    if erode_px > 0:
+        k_erode = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (erode_px * 2 + 1, erode_px * 2 + 1))
+        clean = cv2.erode(clean, k_erode, iterations=1)
 
     return clean
 
@@ -139,11 +168,13 @@ class TumorSegmenter:
         self,
         checkpoint_path: Optional[str] = None,
         device:          Optional[torch.device] = None,
-        threshold:       float = 0.45,       # slightly lower = more sensitive
+        threshold:       float = 0.45,   # probability cut-off
+        erode_px:        int   = 2,      # boundary erosion pixels (0 = off)
     ):
         self.device    = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu")
         self.threshold = threshold
+        self.erode_px  = erode_px
         self.model, self.config = _load_unet(checkpoint_path, self.device)
         self.demo      = self.model is None
         self._img_size = self.config.get("image_size", 256)
@@ -183,28 +214,46 @@ class TumorSegmenter:
 
     # ── Public API ────────────────────────────────────────────────────
 
-    def segment(self, img_np: np.ndarray, threshold: Optional[float] = None) -> dict:
+    def segment(
+        self,
+        img_np:      np.ndarray,
+        threshold:   Optional[float] = None,
+        cam_map:     Optional[np.ndarray] = None,
+        cam_thr:     float = 0.35,
+        cam_min_pct: float = 0.5,
+    ) -> dict:
         """
         Segment a single MRI image.
 
         Parameters
         ----------
-        img_np    : uint8 RGB numpy array (H, W, 3)
-        threshold : override instance default probability threshold
+        img_np      : uint8 RGB numpy array (H, W, 3)
+        threshold   : override instance default probability threshold
+        cam_map     : optional Grad-CAM heatmap (H×W float [0,1]).
+                      When the U-Net mask is empty (< cam_min_pct % area)
+                      AND cam_map is supplied, the CAM is thresholded and
+                      used as a fallback segmentation mask.  This avoids
+                      showing blank results when the U-Net model has not
+                      been trained on reliable pseudo-masks.
+        cam_thr     : CAM binarisation threshold for fallback
+        cam_min_pct : if U-Net area_pct < this value, activate CAM fallback
 
         Returns
         -------
         dict with keys: prob_map, binary_mask, overlay, contour,
-                        area_pct, elapsed, demo, dice_vs_cam, iou_vs_cam, cam_mask
+                        area_pct, elapsed, demo, dice_vs_cam, iou_vs_cam,
+                        cam_mask, cam_fallback_used
         """
-        thr      = threshold if threshold is not None else self.threshold
-        t0       = time.time()
-        H, W     = img_np.shape[:2]
+        thr  = threshold if threshold is not None else self.threshold
+        t0   = time.time()
+        H, W = img_np.shape[:2]
+
+        cam_fallback_used = False
 
         if self.demo:
             prob_map = _synthetic_mask(img_np)
             prob_map = cv2.resize(prob_map, (W, H), interpolation=cv2.INTER_LINEAR)
-            binary   = _postprocess(prob_map, thr)
+            binary   = _postprocess(prob_map, thr, erode_px=self.erode_px)
         else:
             tensor = self._preprocess(img_np)
             with torch.no_grad():
@@ -212,19 +261,42 @@ class TumorSegmenter:
                 prob_map = (torch.sigmoid(logits)
                             .squeeze().cpu().numpy().astype(np.float32))
             prob_map = cv2.resize(prob_map, (W, H), interpolation=cv2.INTER_LINEAR)
-            binary   = _postprocess(prob_map, thr)      # morphological cleanup
+            binary   = _postprocess(prob_map, thr, erode_px=self.erode_px)
+
+            # ── CAM fallback ───────────────────────────────────────────────
+            # If the trained U-Net gives an empty mask (collapsed model) and
+            # a Grad-CAM heatmap is available, use the CAM as a proxy mask.
+            unet_area_pct = float(binary.mean() * 100)
+            if cam_map is not None and unet_area_pct < cam_min_pct:
+                cam_r  = cv2.resize(
+                    cam_map.astype(np.float32), (W, H),
+                    interpolation=cv2.INTER_LINEAR)
+                # Normalise to [0,1]
+                mn, mx = cam_r.min(), cam_r.max()
+                if mx > mn:
+                    cam_r = (cam_r - mn) / (mx - mn)
+                cam_bin = _postprocess(
+                    cam_r, cam_thr,
+                    min_area_pct=0.1,
+                    erode_px=self.erode_px)
+                if cam_bin.sum() > 0:
+                    binary            = cam_bin
+                    prob_map          = cam_r
+                    cam_fallback_used = True
+                    logger.debug("[Segmenter] U-Net empty — using CAM fallback")
 
         return {
-            "prob_map":    prob_map,
-            "binary_mask": binary,
-            "overlay":     self._make_overlay(img_np, binary),
-            "contour":     self._make_contour(img_np, binary),
-            "area_pct":    float(binary.mean() * 100),
-            "elapsed":     round(time.time() - t0, 3),
-            "demo":        self.demo,
-            "dice_vs_cam": None,
-            "iou_vs_cam":  None,
-            "cam_mask":    None,
+            "prob_map":         prob_map,
+            "binary_mask":      binary,
+            "overlay":          self._make_overlay(img_np, binary),
+            "contour":          self._make_contour(img_np, binary),
+            "area_pct":         float(binary.mean() * 100),
+            "elapsed":          round(time.time() - t0, 3),
+            "demo":             self.demo,
+            "cam_fallback":     cam_fallback_used,
+            "dice_vs_cam":      None,
+            "iou_vs_cam":       None,
+            "cam_mask":         None,
         }
 
     def compare_with_gradcam(self, seg_result: dict, cam: np.ndarray,

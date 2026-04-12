@@ -1312,7 +1312,10 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                 seg_result    = None
                 if segmenter is not None and _SEG:
                     try:
-                        seg_result = segmenter.segment(orig_rgb)
+                        # Pass Grad-CAM heatmap so the segmenter can use it
+                        # as a fallback when the U-Net mask is empty (collapsed model).
+                        _cam_for_seg = gc_result["cam"] if gc_result is not None else None
+                        seg_result = segmenter.segment(orig_rgb, cam_map=_cam_for_seg)
 
                         # Compare with GradCAM if available
                         if gc_result is not None:
@@ -1338,10 +1341,12 @@ NeuroScan AI v{APP_VERSION} · Built with PyTorch · timm · Gradio · ReportLab
                             demo        = seg_result["demo"],
                         )
                         seg_html_str = _seg_html_fn(seg_result)
+                        _cam_fb = seg_result.get("cam_fallback", False)
                         logger.info(
                             f"[Seg] done ({seg_result['elapsed']:.2f}s, "
                             f"area={seg_result['area_pct']:.1f}%, "
-                            f"demo={seg_result['demo']})")
+                            f"demo={seg_result['demo']}, "
+                            f"cam_fallback={_cam_fb})")
                     except Exception as es:
                         logger.warning(f"[Seg] failed: {es}")
 

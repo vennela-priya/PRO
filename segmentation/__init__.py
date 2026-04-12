@@ -1,12 +1,15 @@
 """
 segmentation/ — U-Net brain tumour segmentation package.
 """
-from .unet    import UNet
-from .losses  import BCEDiceLoss, dice_loss
-from .metrics import dice_score, iou_score, pixel_accuracy
+from .unet            import UNet
+from .attention_unet  import AttentionUNet
+from .losses          import (CombinedSegLoss, TverskyLoss,
+                               DiceLoss, BoundaryLoss)
+from .metrics         import (compute_all_metrics,
+                               dice_score, iou_score)
 
 __all__ = [
-    "UNet",
-    "BCEDiceLoss", "dice_loss",
-    "dice_score", "iou_score", "pixel_accuracy",
+    "UNet", "AttentionUNet",
+    "CombinedSegLoss", "TverskyLoss", "DiceLoss", "BoundaryLoss",
+    "compute_all_metrics", "dice_score", "iou_score",
 ]
