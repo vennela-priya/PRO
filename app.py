@@ -233,15 +233,54 @@ class ResNetCBAM(nn.Module):
         return self.head(self.pool(x).flatten(1))
 
 
+class EfficientNetWrapper(nn.Module):
+    """Mirrors the old training structure: backbone.* + head.(0-4)"""
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.backbone = timm.create_model(
+            "efficientnet_b3.ra2_in1k", pretrained=False,
+            num_classes=0, global_pool="")
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(1536, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(512, num_classes),
+        )
+
+    def forward(self, x):
+        return self.head(self.pool(self.backbone(x)).flatten(1))
+
+
+class DenseNetWrapper(nn.Module):
+    """Mirrors the old training structure: backbone.* + head.(0-4)"""
+    def __init__(self, num_classes: int):
+        super().__init__()
+        self.backbone = timm.create_model(
+            "densenet121", pretrained=False,
+            num_classes=0, global_pool="")
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(
+            nn.Dropout(0.4),
+            nn.Linear(1024, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(512, num_classes),
+        )
+
+    def forward(self, x):
+        return self.head(self.pool(self.backbone(x)).flatten(1))
+
+
 def _make_efficientnet(nc: int) -> nn.Module:
-    return timm.create_model(
-        "efficientnet_b3.ra2_in1k", pretrained=False, num_classes=nc)
+    return EfficientNetWrapper(nc)
 
 def _make_resnet_cbam(nc: int) -> nn.Module:
     return ResNetCBAM(nc, pretrained=False)
 
 def _make_densenet(nc: int) -> nn.Module:
-    return timm.create_model("densenet121", pretrained=False, num_classes=nc)
+    return DenseNetWrapper(nc)
 
 
 class Ensemble(nn.Module):
@@ -321,15 +360,11 @@ def _remap_keys(raw_sd: dict, mname: str) -> dict:
     new_sd = {}
     for k, v in raw_sd.items():
         nk = k
-        # Strip backbone. prefix
-        if nk.startswith("backbone."):
+        # EfficientNet / DenseNet wrappers keep backbone.* prefix — no stripping needed.
+        # ResNet+CBAM was saved without backbone. prefix in newer checkpoints, but old
+        # checkpoints may have it — strip for resnet_cbam only.
+        if mname == "resnet_cbam" and nk.startswith("backbone."):
             nk = nk[len("backbone."):]
-        # EfficientNet / DenseNet: old head (512-dim bottle-neck) shape doesn't match
-        # the new timm classifier (direct feat→nc linear).  Drop all head.* keys and
-        # let strict=False leave classifier randomly initialised — backbone still loads.
-        if mname in ("efficientnet", "densenet"):
-            if nk.startswith("head."):
-                continue
         # ResNet+CBAM: CBAM channel-attention weights were saved as Conv2d [out,in,1,1];
         # current ChannelAttention uses Linear [out,in] — squeeze spatial dims.
         if "cbam" in nk and "ca.fc" in nk and v.dim() == 4:
@@ -392,8 +427,8 @@ def load_model() -> Tuple[Union[Ensemble, MockEnsemble], str]:
                     logger.info(f"  {mname}: {ckpt.name} (remapped) "
                                 f"missing={len(missing)} extra={len(extra)}")
                     # Skip if the output layer wasn't loaded (random classifier = useless)
-                    _out_key = {"efficientnet": "classifier.weight",
-                                "densenet":     "classifier.weight",
+                    _out_key = {"efficientnet": "head.4.weight",
+                                "densenet":     "head.4.weight",
                                 "resnet_cbam":  "head.4.weight"}.get(mname, "")
                     if _out_key and _out_key in missing:
                         logger.warning(f"  {mname}: output layer missing after remap "
