@@ -55,7 +55,7 @@ _NAVY  = "#0f172a"
 _SLATE = "#1e293b"
 _CYAN  = "#00d4ff"
 _LGRAY = "#cbd5e1"
-_GRAY  = "#94a3b8"
+_GRAY  = "#334155"
 _RED   = "#ef4444"
 _AMB   = "#f59e0b"
 _GRN   = "#10b981"
@@ -343,11 +343,21 @@ def generate_report(
     risk_icon = {"CRITICAL": "🔴", "HIGH": "🟠",
                  "MODERATE": "🔵", "LOW": "🟢"}.get(risk, "⚪")
 
+    # Auto-scale font so every tumor name fits on ONE line in the 6.5 cm column
+    # (usable ≈ 164 pt after 10 pt padding each side)
+    # Helvetica-Bold glyph widths (units/1000 em) used for sizing:
+    #   GLIOMA(6)=3835  NO TUMOR(8)=5277  PITUITARY(9)=5060  MENINGIOMA(10)=6448
+    label_upper = label.upper()
+    _fn_size = (28 if len(label_upper) <= 6 else
+                24 if len(label_upper) <= 8 else
+                20 if len(label_upper) <= 9 else 18)
+
     find_data = [[
         Paragraph(
-            f"<b>{label.upper()}</b>",
-            _sty("fn", fontName="Helvetica-Bold", fontSize=28,
-                 textColor=cls_col, alignment=TA_CENTER),
+            f"<b>{label_upper}</b>",
+            _sty("fn", fontName="Helvetica-Bold", fontSize=_fn_size,
+                 textColor=cls_col, alignment=TA_CENTER,
+                 leading=_fn_size + 4),
         ),
         Paragraph(
             f"<b>Diagnosis:</b> {label.upper()}<br/>"
@@ -360,7 +370,7 @@ def generate_report(
         ),
     ]]
     find_tbl = Table(find_data,
-                     colWidths=[4.5 * cm, usable_w - 4.5 * cm])
+                     colWidths=[6.5 * cm, usable_w - 6.5 * cm])
     find_tbl.setStyle(TableStyle([
         ("BACKGROUND",    (0, 0), (0, 0), NAVY),
         ("BACKGROUND",    (1, 0), (1, 0), SLATE),
@@ -471,151 +481,7 @@ def generate_report(
         story.append(ens_tbl)
 
     # ================================================================
-    # PAGE 2 — IMAGING EVIDENCE
-    # ================================================================
-    story.append(PageBreak())
-    story.append(Paragraph("IMAGING EVIDENCE", sec))
-    story.append(_hr())
-
-    # ── MRI + GradCAM overlay side by side ────────────────────────────
-    img_cells = []
-
-    if image is not None:
-        try:
-            mri_rl = _np_to_rl_image(image, 7.0, 7.0)
-            img_cells.append(mri_rl)
-        except Exception as e:
-            logger.warning(f"[Report] MRI embed failed: {e}")
-            img_cells.append(Paragraph("(MRI image unavailable)", sm))
-
-    if gradcam_result and gradcam_result.get("visuals"):
-        try:
-            overlay_arr = gradcam_result["visuals"]["overlay"]
-            gcam_rl = _np_to_rl_image(overlay_arr, 7.0, 7.0)
-            img_cells.append(gcam_rl)
-        except Exception as e:
-            logger.warning(f"[Report] GradCAM overlay embed failed: {e}")
-            img_cells.append(Paragraph("(Heatmap unavailable)", sm))
-
-    if img_cells:
-        if len(img_cells) == 1:
-            img_cells = [img_cells[0],
-                         Paragraph("(GradCAM not available)", sm)]
-        img_row = [[img_cells[0], img_cells[1]]]
-        img_tbl = Table(img_row,
-                        colWidths=[usable_w / 2, usable_w / 2])
-        img_tbl.setStyle(TableStyle([
-            ("VALIGN",      (0, 0), (-1, -1), "TOP"),
-            ("ALIGN",       (0, 0), (-1, -1), "CENTER"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING",(0, 0), (-1, -1), 4),
-        ]))
-        story.append(img_tbl)
-
-        cap_row = [[
-            Paragraph("Figure 1: Original MRI scan",
-                      _sty("cap1", fontName="Helvetica-Oblique",
-                           fontSize=7, textColor=GRAY, alignment=TA_CENTER)),
-            Paragraph("Figure 2: Grad-CAM activation overlay",
-                      _sty("cap2", fontName="Helvetica-Oblique",
-                           fontSize=7, textColor=GRAY, alignment=TA_CENTER)),
-        ]]
-        cap_tbl = Table(cap_row,
-                        colWidths=[usable_w / 2, usable_w / 2])
-        cap_tbl.setStyle(TableStyle([
-            ("TOPPADDING",    (0, 0), (-1, -1), 3),
-            ("LEFTPADDING",   (0, 0), (-1, -1), 4),
-            ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
-        ]))
-        story.append(cap_tbl)
-
-    story.append(Spacer(1, 0.3 * cm))
-
-    # ── 4-panel GradCAM composite ─────────────────────────────────────
-    if gradcam_result and gradcam_result.get("visuals", {}).get("composite") is not None:
-        try:
-            comp_arr = gradcam_result["visuals"]["composite"]
-            story.append(Paragraph("GRAD-CAM ANALYSIS PANEL", sec))
-            composite_rl = _np_to_rl_image(
-                comp_arr, usable_w / cm, 4.0
-            )
-            story.append(composite_rl)
-            story.append(
-                Paragraph(
-                    "Figure 3: (Left→Right) Original MRI | Activation Map (Jet) "
-                    "| GradCAM Overlay | Tumour Boundary (threshold > 0.5)",
-                    _sty("cap3", fontName="Helvetica-Oblique", fontSize=7,
-                         textColor=GRAY, alignment=TA_CENTER),
-                )
-            )
-            story.append(
-                Paragraph(
-                    "🔴 Red areas = high tumour probability  "
-                    "🟡 Yellow = moderate  🔵 Blue = low activation",
-                    _sty("leg", fontName="Helvetica", fontSize=7.5,
-                         textColor=GRAY, alignment=TA_CENTER),
-                )
-            )
-        except Exception as e:
-            logger.warning(f"[Report] Composite embed failed: {e}")
-
-    story.append(Spacer(1, 0.3 * cm))
-
-    # ── TUMOUR LOCALISATION ───────────────────────────────────────────
-    if gradcam_result and gradcam_result.get("stats"):
-        story.append(_hr(0.5, _hex("#334155")))
-        story.append(Paragraph(
-            "TUMOUR LOCALISATION (GRAD-CAM ANALYSIS)", sec))
-        stats = gradcam_result["stats"]
-        area    = stats["area_pct"]
-        cx, cy  = stats["centroid"]
-        lateral = stats["lateralization"]
-        score   = stats["intensity_score"]
-        x1, y1, x2, y2 = stats["bbox"]
-        g_elapsed = gradcam_result.get("elapsed", 0)
-        demo_note = (" [Demo Mode]"
-                     if gradcam_result.get("demo") else "")
-
-        loc_rows = [
-            [Paragraph("<b>Parameter</b>", sub),
-             Paragraph("<b>Value</b>",     sub),
-             Paragraph("<b>Notes</b>",     sub)],
-            ["Estimated Area",
-             f"{area:.1f}% of visible scan",
-             "High" if area > 20 else "Moderate" if area > 10 else "Low"],
-            ["Hemisphere / Location",
-             lateral + demo_note, "Based on centroid x-position"],
-            ["Centroid Position",
-             f"({cx}, {cy}) pixels", "Hottest activation pixel centroid"],
-            ["Bounding Region",
-             f"[{x1},{y1}] → [{x2},{y2}]", "Pixel coordinates of activation box"],
-            ["Activation Score",
-             f"{score} / 100",
-             "Mean activation in region (0=low, 100=high)"],
-            ["GradCAM Computed",
-             f"{g_elapsed}s", "CPU inference time"],
-        ]
-
-        col_w = [4.0 * cm, 5.5 * cm, usable_w - 9.5 * cm]
-        loc_tbl = Table(loc_rows, colWidths=col_w)
-        loc_tbl.setStyle(TableStyle([
-            ("BACKGROUND",     (0, 0), (-1, 0), SLATE),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-             [_hex(_NAVY), SLATE]),
-            ("GRID",           (0, 0), (-1, -1), 0.2, _hex("#334155")),
-            ("LINEBELOW",      (0, 0), (-1, 0), 1, CYAN),
-            ("TOPPADDING",     (0, 0), (-1, -1), 4),
-            ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
-            ("LEFTPADDING",    (0, 0), (-1, -1), 6),
-            ("FONTNAME",       (0, 1), (0, -1), "Helvetica-Bold"),
-            ("FONTSIZE",       (0, 0), (-1, -1), 8),
-            ("TEXTCOLOR",      (0, 0), (-1, 0), CYAN),
-            ("TEXTCOLOR",      (0, 1), (-1, -1), LGRAY),
-        ]))
-        story.append(loc_tbl)
-
-    # ================================================================
-    # PAGE 3 — CLINICAL INTERPRETATION
+    # PAGE 2 — CLINICAL INTERPRETATION
     # ================================================================
     story.append(PageBreak())
     story.append(Paragraph("CLINICAL INTERPRETATION", sec))
@@ -635,43 +501,6 @@ def generate_report(
                  textColor=LGRAY, leading=14, leftIndent=10),
         ))
     story.append(Spacer(1, 0.3 * cm))
-
-    # ── TECHNICAL DETAILS ─────────────────────────────────────────────
-    story.append(Paragraph("TECHNICAL DETAILS", sec))
-    tech_data = [
-        [Paragraph("<b>Parameter</b>", sub),
-         Paragraph("<b>Value</b>",     sub)],
-        ["Architecture",    "EfficientNet-B3 + ResNet50+CBAM + DenseNet121"],
-        ["Inference",       "TTA (6-view: orig, H-flip, V-flip, rot90/180/270)"],
-        ["Ensemble method", "Confidence-weighted average + temperature scaling"],
-        ["GradCAM method",  "Standard Grad-CAM on last conv layer per backbone"],
-        ["Model AUC",       "0.9996 (macro one-vs-rest, test set n=1311)"],
-        ["Model Accuracy",  "98.78%"],
-        ["Sensitivity",     "98.68%  |  Specificity: 99.59%"],
-        ["Device",          "CPU (no GPU detected)"],
-        ["Processing time", f"{ela:.2f}s (inference) + "
-                            f"{gradcam_result.get('elapsed', 0) if gradcam_result else 0:.2f}s"
-                            f" (GradCAM)"],
-    ]
-    tech_tbl = Table(tech_data,
-                     colWidths=[4.5 * cm, usable_w - 4.5 * cm])
-    tech_tbl.setStyle(TableStyle([
-        ("BACKGROUND",     (0, 0), (-1, 0), SLATE),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1),
-         [_hex(_NAVY), SLATE]),
-        ("GRID",           (0, 0), (-1, -1), 0.2, _hex("#334155")),
-        ("LINEBELOW",      (0, 0), (-1, 0), 1, CYAN),
-        ("TOPPADDING",     (0, 0), (-1, -1), 3),
-        ("BOTTOMPADDING",  (0, 0), (-1, -1), 3),
-        ("LEFTPADDING",    (0, 0), (-1, -1), 6),
-        ("FONTNAME",       (0, 1), (0, -1), "Helvetica-Bold"),
-        ("FONTSIZE",       (0, 0), (-1, -1), 7.5),
-        ("TEXTCOLOR",      (0, 0), (-1, 0), CYAN),
-        ("TEXTCOLOR",      (0, 1), (0, -1), _hex("#00d4ff")),
-        ("TEXTCOLOR",      (1, 1), (1, -1), LGRAY),
-    ]))
-    story.append(tech_tbl)
-    story.append(Spacer(1, 0.35 * cm))
 
     # ── DISCLAIMER ────────────────────────────────────────────────────
     story.append(_hr(0.5, _hex("#334155")))
