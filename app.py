@@ -16,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s — %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[logging.FileHandler("app.log"), logging.StreamHandler(sys.stdout)],
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("NeuroScanAI")
 
@@ -796,6 +796,7 @@ def generate_pdf(result: Dict, image, patient_name: str, patient_id: str) -> Opt
                               topMargin=1.5*cm, bottomMargin=1.5*cm,
                               leftMargin=2*cm,  rightMargin=2*cm)
     story = []
+    image_buffers = []
 
     def sty(name, **kw): return ParagraphStyle(name, **kw)
 
@@ -909,9 +910,11 @@ def generate_pdf(result: Dict, image, patient_name: str, patient_id: str) -> Opt
             pil_img = (Image.fromarray(image.astype(np.uint8))
                        if isinstance(image, np.ndarray)
                        else image)
-            tmp = f"_tmp_{rid}.jpg"
-            pil_img.convert("RGB").resize((300, 300)).save(tmp, "JPEG", quality=90)
-            rl_img  = RLImage(tmp, width=5.5*cm, height=5.5*cm)
+            img_buf = io.BytesIO()
+            pil_img.convert("RGB").resize((300, 300)).save(img_buf, "JPEG", quality=90)
+            img_buf.seek(0)
+            image_buffers.append(img_buf)
+            rl_img  = RLImage(img_buf, width=5.5*cm, height=5.5*cm)
             lay_tbl = Table([[rl_img, prob_tbl]], colWidths=[6.5*cm, 10.5*cm])
             lay_tbl.setStyle(TableStyle([
                 ("VALIGN",      (0,0),(-1,-1),"TOP"),
@@ -919,8 +922,6 @@ def generate_pdf(result: Dict, image, patient_name: str, patient_id: str) -> Opt
                 ("RIGHTPADDING",(0,0),(-1,-1), 4),
             ]))
             story.append(lay_tbl)
-            if Path(tmp).exists():
-                os.remove(tmp)
         else:
             story.append(prob_tbl)
     except Exception as e:
